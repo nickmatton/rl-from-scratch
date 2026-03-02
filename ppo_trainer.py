@@ -25,7 +25,10 @@ class PPOTrainer:
         gamma: float = 1.0,
         lam: float = 0.95,
         value_loss_coef: float = 0.5,
-        max_gen_len: int = 64
+        max_gen_len: int = 128,
+        batch_size: int = 16,
+        num_iterations: int = 50,
+        ppo_epochs: int = 4
     ):
         self.policy_model = policy_model
         self.ref_model = ref_model
@@ -39,11 +42,19 @@ class PPOTrainer:
         self.lam = lam
         self.value_loss_coef = value_loss_coef
         self.max_gen_len = max_gen_len
+        self.batch_size = batch_size
+        self.num_iterations = num_iterations
+        self.ppo_epochs = ppo_epochs
 
 
 
-        self.optimizer = torch.optim.AdamW(
-            list(self.policy_model.parameters()) + list(self.value_model.parameters()),
+        self.policy_optimizer = torch.optim.AdamW(
+            self.policy_model.parameters(),
+            lr=1e-6,
+            weight_decay=0.01
+        )
+        self.value_optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, self.value_model.parameters()),
             lr=1e-6,
             weight_decay=0.01
         )
@@ -219,7 +230,7 @@ class PPOTrainer:
         returns = advantages + values # (gen_len,)
         return advantages, returns
 
-    def ppo_step(self, rollouts: list[dict], ppo_epochs: int = 4):
+    def ppo_step(self, rollouts: dict):
         """Run PPO optimization on rollouts"""
         self.policy_model.train()
         self.value_model.train()
@@ -241,7 +252,8 @@ class PPOTrainer:
         # --- PPO epochs: re-use same rollouts multiple times ---
         total_policy_loss = 0.0
         total_value_loss = 0.0
-        for epoch in range(ppo_epochs):
+        total_kl = 0.0
+        for epoch in range(self.ppo_epochs):
             # --- Unpack rollouts ---
             full_ids = rollouts['full_ids']              # (batch_size, total_len)
             full_mask = rollouts['full_mask']            # (batch_size, total_len)
@@ -268,8 +280,8 @@ class PPOTrainer:
             curr_logprobs = curr_logprobs_gen.gather(
                 dim=-1,
                 index=gen_ids.unsqueeze(-1) # (batch_size, gen_len, 1)
-            ).squeeze(-1)      
-            
+            ).squeeze(-1)
+
             # --- Compute Current value Estimates ---
             curr_values_all = self.value_model(
                 input_ids=full_ids,
@@ -284,10 +296,9 @@ class PPOTrainer:
             adv_masked = advantages[mask_bool]                                        # (num_real_tokens)
             adv_normalized = (adv_masked - adv_masked.mean()) / (adv_masked.std() + 1e-8)   # (num_real_tokens)
 
-            # Probability ratio:
-            ratio = torch.exp(
-                curr_logprobs[mask_bool] - old_logprobs[mask_bool]
-            )   # (num_real_tokens,)
+            # Probability ratio (clamped to prevent extreme spikes):
+            log_ratio = curr_logprobs[mask_bool] - old_logprobs[mask_bool]
+            ratio = torch.exp(torch.clamp(log_ratio, -2.0, 2.0))   # (num_real_tokens,)
 
             # Clipped policy-gradient surrogate
             surr1 = ratio * adv_normalized
@@ -296,7 +307,7 @@ class PPOTrainer:
             ) * adv_normalized
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # --- Value Loss ---
+            # --- Value Loss (simple MSE) ---
             value_loss = F.mse_loss(
                 curr_values[mask_bool],
                 returns[mask_bool]
@@ -305,26 +316,34 @@ class PPOTrainer:
             # --- Combined loss ---
             loss = policy_loss + self.value_loss_coef * value_loss
 
-            # --- Gradient setp ---
-            self.optimizer.zero_grad()
+            # --- Gradient step ---
+            self.policy_optimizer.zero_grad()
+            self.value_optimizer.zero_grad()
             loss.backward()
-            clip_grad_norm_(
-                list(self.policy_model.parameters()) + list(self.value_model.parameters()),
-                max_norm=1.0
-            )
-            self.optimizer.step()
+            clip_grad_norm_(self.policy_model.parameters(), max_norm=1.0)
+            clip_grad_norm_(self.value_model.parameters(), max_norm=1.0)
+            self.policy_optimizer.step()
+            self.value_optimizer.step()
 
             total_policy_loss += policy_loss.item()
             total_value_loss += value_loss.item()
 
+            # Track KL divergence between current and old policy
+            with torch.no_grad():
+                kl = (old_logprobs[mask_bool] - curr_logprobs[mask_bool]).mean().item()
+            total_kl += kl
+
         # --- Return avg losses for logging ---
-        avg_policy_loss = total_policy_loss / ppo_epochs
-        avg_value_loss = total_value_loss / ppo_epochs
-        return avg_policy_loss, avg_value_loss
+        n = self.ppo_epochs
+        return {
+            'policy_loss': total_policy_loss / n,
+            'value_loss': total_value_loss / n,
+            'mean_kl': total_kl / n,
+        }
     
-    def train(self, prompts: list[str], num_epochs: int = 50, batch_size: int = 4):
+    def train(self, prompts: list[str]):
         """Main PPO Training Loop"""
-        
+
         with open('prompts/ppo_prompt_template.md', 'r') as f:
             template = f.read()
 
@@ -332,21 +351,22 @@ class PPOTrainer:
             template.format(prompt=p) for p in prompts
         ]
 
-        for epoch in range(num_epochs):
-            batch_indicies = torch.randint(0, len(formatted_prompts), (batch_size,))
+        for iteration in range(self.num_iterations):
+            batch_indicies = torch.randint(0, len(formatted_prompts), (self.batch_size,))
             batch_prompts = [formatted_prompts[i] for i in batch_indicies]
 
             rollouts = self.generate_rollouts(batch_prompts)
 
-            avg_policy_loss, avg_value_loss = self.ppo_step(rollouts)
+            stats = self.ppo_step(rollouts)
 
             avg_reward = sum(rollouts['reward_score']) / len(rollouts['reward_score'])
-            print(f"Iter {epoch+1}/{num_epochs} | "
-                  f"Policy Loss: {avg_policy_loss:.4f} | "
-                  f"Value Loss: {avg_value_loss:.4f} | "
+            print(f"Iter {iteration+1}/{self.num_iterations} | "
+                  f"Policy Loss: {stats['policy_loss']:.4f} | "
+                  f"Value Loss: {stats['value_loss']:.4f} | "
+                  f"KL: {stats['mean_kl']:.4f} | "
                   f"Avg Reward: {avg_reward:.4f}")
 
-            if (epoch + 1) %10 == 0:
+            if (iteration + 1) %10 == 0:
                 print(f"  Sample: {rollouts['response_text'][0][:200]}")
 
                 # --- Save trained policy ---
