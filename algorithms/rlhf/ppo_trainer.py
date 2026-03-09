@@ -12,7 +12,7 @@ from tqdm import tqdm
 import json
 
 from torch.nn.utils import clip_grad_norm_
-from common.utils import get_device
+from common.utils import get_device, extract_gen_logprobs
 
 class PPOTrainer:
     def __init__(
@@ -132,14 +132,7 @@ class PPOTrainer:
 
         # logits at pos t predict the token at pos t+1
         # so logits at [padded_prompt_len - 1 : total_len - 1] are our predictors
-        policy_logprobs_all = F.log_softmax(policy_logits, dim=-1)                          # (batch_size, total_len, vocab_size)
-        policy_logprobs_gen = policy_logprobs_all[:, padded_prompt_len-1:total_len-1, :]    # (batch_size, gen_len, vocab_size)
-        policy_logprobs = policy_logprobs_gen.gather(
-            dim=-1,
-            index=gen_ids.unsqueeze(-1) #  (batch, gen_len, 1) unsqueeze so the dimsensions match
-        ).squeeze(-1) # squeeze to drop extra dim
-        # Note: gather will index into logprobs for each (batch, postion, index) triplet. in our case we only have 1 index
-        # This pulls out the logprob for the chosen token at each postion in the sequence for each batch
+        policy_logprobs = extract_gen_logprobs(policy_logits, gen_ids, padded_prompt_len, total_len)
 
         # --- Ref model forward pass ---
         # Get log probs for ref model with forward pass
@@ -147,12 +140,7 @@ class PPOTrainer:
             input_ids=full_ids,
             attention_mask=full_mask
         ).logits
-        ref_logprobs_all = F.log_softmax(ref_logits, dim=-1)
-        ref_logprobs_gen = ref_logprobs_all[:, padded_prompt_len-1 : total_len-1, :]
-        ref_logprobs = ref_logprobs_gen.gather(
-            dim=-1,
-            index=gen_ids.unsqueeze(-1)
-        ).squeeze(-1)
+        ref_logprobs = extract_gen_logprobs(ref_logits, gen_ids, padded_prompt_len, total_len)
 
         # --- Value Estimates ---
         values_all = self.value_model(
@@ -251,25 +239,25 @@ class PPOTrainer:
             ret_list.append(returns)
         rollouts['advantages'] = torch.stack(adv_list)
         rollouts['returns'] = torch.stack(ret_list)
+
+        # --- Unpack rollouts ---
+        full_ids = rollouts['full_ids']              # (batch_size, total_len)
+        full_mask = rollouts['full_mask']            # (batch_size, total_len)
+        gen_ids = rollouts['gen_ids']                # (batch_size, gen_len)
+        gen_mask = rollouts['gen_mask']              # (batch_size, gen_len)
+        old_logprobs = rollouts['old_logprobs']      # (batch_size, gen_len)
+        advantages = rollouts['advantages']          # (batch_size, gen_len)
+        returns = rollouts['returns']                # (batch_size, gen_len)
+
+        total_len = full_ids.shape[1]
+        gen_len = gen_ids.shape[1]
+        prompt_len = total_len - gen_len
         
         # --- PPO epochs: re-use same rollouts multiple times ---
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_kl = 0.0
         for epoch in range(self.ppo_epochs):
-            # --- Unpack rollouts ---
-            full_ids = rollouts['full_ids']              # (batch_size, total_len)
-            full_mask = rollouts['full_mask']            # (batch_size, total_len)
-            gen_ids = rollouts['gen_ids']                # (batch_size, gen_len)
-            gen_mask = rollouts['gen_mask']              # (batch_size, gen_len)
-            old_logprobs = rollouts['old_logprobs']      # (batch_size, gen_len)
-            advantages = rollouts['advantages']          # (batch_size, gen_len)
-            returns = rollouts['returns']                # (batch_size, gen_len)
-
-            total_len = full_ids.shape[1]
-            gen_len = gen_ids.shape[1]
-            prompt_len = total_len - gen_len
-
             # --- compute policy log-probs ---
             # Forward pass on current policy
             curr_logits = self.policy_model(
@@ -278,12 +266,7 @@ class PPOTrainer:
             ).logits    # (1, total_len, vocab_len)
 
             # Same offset + gather logic as in gen_rollouts
-            curr_logprobs_all = F.log_softmax(curr_logits, dim =-1)                 # (batch_size, total_len, vocab_Size)
-            curr_logprobs_gen = curr_logprobs_all[:, prompt_len-1:total_len-1, :]   # (batch_size, gen_len, vocab_size)
-            curr_logprobs = curr_logprobs_gen.gather(
-                dim=-1,
-                index=gen_ids.unsqueeze(-1) # (batch_size, gen_len, 1)
-            ).squeeze(-1)
+            curr_logprobs = extract_gen_logprobs(curr_logits, gen_ids, prompt_len, total_len)
 
             # --- Compute Current value Estimates ---
             curr_values_all = self.value_model(

@@ -4,9 +4,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from transformers import PreTrainedModel, PreTrainedTokenizer
+
+from common.utils import extract_gen_logprobs
 
 class ReinforceTrainer:
     def __init__(
@@ -76,7 +77,7 @@ class ReinforceTrainer:
             input_ids=full_ids,
             attention_mask=full_mask
         ).logits
-        policy_logprobs = self._extract_gen_logprobs(
+        policy_logprobs = extract_gen_logprobs(
             policy_logits, gen_ids, padded_prompt_len, total_len
         )
 
@@ -84,7 +85,7 @@ class ReinforceTrainer:
             input_ids=full_ids,
             attention_mask=full_mask
         ).logits
-        ref_logprobs = self._extract_gen_logprobs(
+        ref_logprobs = extract_gen_logprobs(
             ref_logits, gen_ids, padded_prompt_len, total_len
         )
 
@@ -114,17 +115,6 @@ class ReinforceTrainer:
             "response_texts": response_texts,
         }
 
-    def _extract_gen_logprobs(self, logits, gen_ids, prompt_len, total_len) -> torch.Tensor:
-        """Extract log-probabilities for the generated tokens.
-
-        logits[:, t, :] predicts token at position t+1, so we offset by -1.
-        """
-        logprobs_all = F.log_softmax(logits, dim=-1)
-        logprobs_gen = logprobs_all[:, prompt_len - 1 : total_len - 1, :]
-        return logprobs_gen.gather(
-            dim=-1, index=gen_ids.unsqueeze(-1)
-        ).squeeze(-1)
-    
     def compute_monte_carlo_returns(self, reward_scores, kl_per_token, gen_mask):
         """
         Monte Carlo returns: G_t = sum_{k=0}^{T-t} gamma^k * r_{t+k}
@@ -168,7 +158,7 @@ class ReinforceTrainer:
             input_ids=full_ids,
             attention_mask=full_mask
         ).logits
-        log_probs = self._extract_gen_logprobs(logits, gen_ids, prompt_len, total_len)
+        log_probs = extract_gen_logprobs(logits, gen_ids, prompt_len, total_len)
 
         returns = self.compute_monte_carlo_returns(
             rollouts["reward_scores"], rollouts["kl_per_token"], gen_mask
