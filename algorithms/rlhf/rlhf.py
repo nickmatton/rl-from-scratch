@@ -13,7 +13,7 @@ def run_sft():
     print("=" * 60)
     print("Stage 1: Supervised Fine-Tuning (SFT)")
     print("=" * 60)
-    from algorithms.rlhf.sft import train
+    from algorithms.sft.sft import train
     train()
     print()
 
@@ -22,7 +22,7 @@ def run_reward():
     print("=" * 60)
     print("Stage 2: Reward Model Training")
     print("=" * 60)
-    from algorithms.rlhf.train_reward import train_reward_model
+    from models.train_reward import train_reward_model
     train_reward_model()
     print()
 
@@ -31,7 +31,7 @@ def run_ppo():
     print("=" * 60)
     print("Stage 3: PPO Training")
     print("=" * 60)
-    from algorithms.rlhf.train_ppo import main as train_ppo
+    from algorithms.ppo.train_ppo import main as train_ppo
     train_ppo()
     print()
 

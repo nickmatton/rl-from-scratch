@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 
 from common.utils import get_device
-from algorithms.rlhf.sft_dataset import SFTDataset
+from algorithms.sft.sft_dataset import SFTDataset
 
 def train(model_name="gpt2", data_path="data/sft_data.json", output_dir="sft_model", epochs=20, batch_size=8, learning_rate=5e-5, log_file="checkpoints/sft/training_log.csv"):
     device = get_device()

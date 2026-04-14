@@ -33,16 +33,16 @@ class GRPOTrainer:
         self.kl_coef = kl_coef
         self.clip_eps = clip_eps
         self.max_gen_len = max_gen_len
-        # self.optimizer = torch.optim.AdamW(
-        #     self.policy_model.parameters(), lr=lr, weight_decay=0.01
-        # )
-        # Lets try using Muon
-        self.optimizer = torch.optim.Muon(
-            self.policy_model.parameters(),
-            lr=0.02,
-            weight_decay=0.01,
-            momentum=0.95
+        self.optimizer = torch.optim.AdamW(
+            self.policy_model.parameters(), lr=lr, weight_decay=0.01
         )
+        # Lets try using Muon
+        # self.optimizer = torch.optim.Muon(
+        #     self.policy_model.parameters(),
+        #     lr=0.02,
+        #     weight_decay=0.01,
+        #     momentum=0.95
+        # )
         self.batch_size = batch_size
         self.group_size = group_size
         self.grpo_epochs = grpo_epochs
@@ -203,7 +203,7 @@ class GRPOTrainer:
             "avg_reward": rollouts["reward_scores"].mean().item(),
         }
     
-    def train(self):
+    def train(self, prompts: list[str]):
 
         with open("prompts/grpo_prompt_template.md", "r") as f:
             template = f.read()
